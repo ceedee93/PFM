@@ -330,9 +330,31 @@ def main():
             infl_opex = st.number_input("Inflation OPEX (%)", 0.0, 5.0, 2.0)
             
             # DATA UPLOAD
-            st.markdown("### Zeitreihen (CSV/XLSX)")
-            data_file = st.file_uploader("Upload PV & Preis Profil (Std.)", type=["csv", "xlsx"])
+# --- IM SIDEBAR BEREICH "4. Marktszenarien" ---
+        st.markdown("### Daten Import")
+        data_source = st.radio("Quelle PV-Daten:", ["Synthetisch (Demo)", "PVGIS Datei uploaden"])
+        
+        pv_profile_norm = None
+        price_profile_series = None
+        
+        if data_source == "PVGIS Datei uploaden":
+            pvgis_file = st.file_uploader("PVGIS CSV/Excel (Stundendaten)", type=["csv", "xlsx", "xls"])
+            if pvgis_file:
+                with st.spinner("Analysiere PVGIS Daten & berechne P50-Jahr..."):
+                    pv_profile_norm = parse_pvgis_file(pvgis_file)
+                    
+                if pv_profile_norm is not None:
+                    st.success("PVGIS Daten erfolgreich konvertiert & normiert!")
+                    
+                    # Vorschau Plot
+                    st.line_chart(pv_profile_norm[:168]) # Erste Woche
+                    st.caption("Vorschau: Normiertes Erzeugungsprofil (Erste 7 Tage)")
             
+            # Preis separat laden (oder Standard nehmen)
+            price_file = st.file_uploader("Strompreise (Optional, sonst Standard)", type=["csv", "xlsx"])
+            if price_file:
+                # ... hier ihr bestehender Preis-Upload Code ...
+                pass
     # --- DATA LOADING & PROCESSING ---
     if data_file:
         try:
@@ -376,7 +398,93 @@ def main():
         # Price: Duck curve + Winter peak
         price_raw = 60 + 20*np.sin(2*np.pi*(t-7)/24) - 30*pv_raw + np.random.normal(0, 10, 8760)
         df_input = pd.DataFrame({'pv': pv_raw, 'price': price_raw}, index=idx)
+def parse_pvgis_file(uploaded_file):
+    """
+    Spezial-Parser für PVGIS CSV/Excel Export mit deutschem Zahlenformat.
+    Analysiert Historie (z.B. 2005-2023) und erstellt ein repräsentatives Durchschnittsjahr (P50).
+    """
+    try:
+        # 1. Einlesen (Versuche verschiedene Trennzeichen, da PVGIS je nach Einstellung variiert)
+        # PVGIS Header überspringen wir oft, aber Pandas 'header' Parameter hilft.
+        try:
+            df = pd.read_csv(uploaded_file, sep=None, engine='python', skipfooter=10) # Footer oft mit Legende
+        except:
+            df = pd.read_excel(uploaded_file)
 
+        # 2. Spalten identifizieren
+        # PVGIS nennt die Spalte oft "P" (Power in W) oder "Gb(i)" etc.
+        # Wir suchen nach der Zeit-Spalte und der Power-Spalte
+        
+        # Zeit-Spalte finden
+        time_col = next((c for c in df.columns if 'time' in c.lower() or 'date' in c.lower() or 'zeit' in c.lower()), None)
+        # Power-Spalte finden (P in Watt)
+        power_col = next((c for c in df.columns if c.strip() == 'P'), None)
+        
+        if not time_col or not power_col:
+            st.error("Konnte Spalten 'time' oder 'P' nicht finden. Bitte prüfen Sie das Format.")
+            return None
+
+        # 3. Deutsch -> Englisch Zahlenkonvertierung (Kritischer Schritt!)
+        # Beispiel: "2.200.940,00" -> 2200940.00
+        if df[power_col].dtype == object: # Wenn es als Text erkannt wurde
+            df[power_col] = df[power_col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+        
+        df[power_col] = pd.to_numeric(df[power_col])
+
+        # 4. Watt in MW umrechnen
+        # PVGIS gibt Watt aus. Wir brauchen MW.
+        df['mw_out'] = df[power_col] / 1_000_000.0 
+
+        # 5. Zeitstempel parsen
+        df[time_col] = pd.to_datetime(df[time_col], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+        df = df.dropna(subset=[time_col])
+        df.set_index(time_col, inplace=True)
+
+        # 6. Repräsentatives Jahr erstellen (P50 Analysis)
+        # Wir haben z.B. 18 Jahre Daten. Wir gruppieren nach Monat, Tag, Stunde und nehmen den Mittelwert.
+        # Das eliminiert Ausreißerjahre.
+        st.info(f"Analysiere historischen Datensatz von {df.index.year.min()} bis {df.index.year.max()}...")
+        
+        # Gruppieren nach (Monat, Tag, Stunde) und Mittelwert bilden
+        # Wir erstellen einen künstlichen Index für 2025 (kein Schaltjahr für Sim)
+        df_p50 = df.groupby([df.index.month, df.index.day, df.index.hour])['mw_out'].mean().reset_index()
+        df_p50.columns = ['month', 'day', 'hour', 'mw']
+        
+        # Fehlerkorrektur für Schaltjahre (29. Feb entfernen, falls im Durchschnitt drin)
+        df_p50 = df_p50[~((df_p50['month'] == 2) & (df_p50['day'] == 29))]
+        
+        # Neuen DateTime Index für das Zieljahr (z.B. 2025) bauen
+        # Wir müssen sicherstellen, dass wir exakt 8760 Zeilen haben
+        dates = pd.date_range(start='2025-01-01', periods=len(df_p50), freq='h')
+        
+        # Falls Längen nicht passen (z.B. fehlende Stunden in PVGIS), interpolieren
+        if len(df_p50) != 8760:
+             # Fallback: Wir nutzen reindexing auf das volle Jahr
+             p50_series = pd.Series(df_p50['mw'].values, index=pd.to_datetime(
+                 dict(year=2025, month=df_p50['month'], day=df_p50['day'], hour=df_p50['hour'])
+             ))
+             full_idx = pd.date_range('2025-01-01', '2025-12-31 23:00', freq='h')
+             p50_series = p50_series.reindex(full_idx).interpolate().fillna(0)
+             final_mw = p50_series.values
+        else:
+            final_mw = df_p50['mw'].values
+
+        # 7. Normalisierung
+        # Das Tool hat einen Schieberegler für "PV Leistung". 
+        # Damit der Schieberegler funktioniert, müssen wir das Profil auf 1 MWp normieren.
+        # Wir teilen durch das Maximum des Profils (oder die installierte Leistung aus der Datei, falls bekannt).
+        # Sicherer Weg: Wir normieren auf den Peak-Wert des P50 Jahres.
+        peak_p50 = final_mw.max()
+        if peak_p50 > 0:
+            normalized_profile = final_mw / peak_p50
+        else:
+            normalized_profile = final_mw
+            
+        return normalized_profile
+
+    except Exception as e:
+        st.error(f"Fehler beim PVGIS-Parsing: {str(e)}")
+        return None
     # --- RUN SIMULATION ---
     
     # 1. Prepare Parameters
@@ -413,7 +521,33 @@ def main():
     df_hourly = model.validate_and_resample_data(df_input)
     pv_series_mw = df_hourly['pv'] * pv_mw # Skaliere auf installierte Leistung
     price_series = df_hourly['price']
+    # --- VOR DEM BUTTON ---
     
+    # Fallback falls kein Upload
+    if pv_profile_norm is None:
+        if data_source == "PVGIS Datei uploaden":
+            st.warning("Bitte Datei hochladen oder auf 'Synthetisch' wechseln.")
+            st.stop()
+        else:
+            # Synthetisch generieren (Code von vorher)
+            t = np.arange(8760)
+            pv_profile_norm = np.maximum(0, -np.cos(2*np.pi*t/24)) * (1 + 0.5*-np.cos(2*np.pi*t/8760)) * np.random.uniform(0.8, 1.0, 8760)
+            pv_profile_norm = pv_profile_norm / pv_profile_norm.max()
+
+    # Fallback Preise
+    if price_profile_series is None:
+         t = np.arange(8760)
+         # Einfache Preiskurve generieren
+         price_profile_series = 60 + 20*np.sin(2*np.pi*(t-7)/24) + np.random.normal(0, 10, 8760)
+
+    # DATEN ZUSAMMENFÜHREN
+    # Hier kommt der "Schieberegler-Trick":
+    # Wir nehmen das normierte Profil (0 bis 1) aus der PVGIS Datei und multiplizieren es
+    # mit der im Tool eingestellten Leistung (z.B. 14 MW).
+    
+    pv_series_mw = pv_profile_norm * pv_mw  # pv_mw kommt aus st.number_input
+    
+    # ... weiter mit Simulation ...
     if st.button("🚀 Simulation starten", type="primary"):
         with st.spinner("Optimiere Dispatch und berechne Cashflow-Wasserfall..."):
             
@@ -526,3 +660,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
