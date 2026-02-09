@@ -215,92 +215,121 @@ class FinancialModel:
 # 2. DATA PARSING FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def parse_pvgis_file(uploaded_file) -> Optional[np.ndarray]:
+def parse_pvgis_file(uploaded_file):
     """
-    Special parser for PVGIS CSV/Excel export with German number format.
-    Analyzes history (e.g., 2005-2023) and creates a representative P50 year.
+    Robuster Parser für PVGIS Daten (CSV oder Excel).
+    Sucht automatisch nach der Kopfzeile, ignoriert Metadaten und 
+    korrigiert deutsche Zahlenformate.
     """
     try:
-        # 1. Read file (try different separators)
-        try:
-            df = pd.read_csv(uploaded_file, sep=None, engine='python', 
-                           skiprows=10, skipfooter=10, encoding='utf-8')
-        except:
-            try:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, sep=',', skiprows=10, skipfooter=10)
-            except:
-                uploaded_file.seek(0)
-                df = pd.read_excel(uploaded_file)
+        # 1. Datei erst einmal "dumm" ohne Header einlesen, um die Struktur zu scannen
+        # Wir lesen die ersten 30 Zeilen, um den Header zu finden
+        file_ext = uploaded_file.name.split('.')[-1].lower()
         
-        # 2. Identify columns
-        time_col = next((c for c in df.columns if 'time' in c.lower() or 
-                        'date' in c.lower() or 'zeit' in c.lower()), None)
-        power_col = next((c for c in df.columns if c.strip() == 'P' or 
-                         'power' in c.lower() or 'pv' in c.lower()), None)
+        if 'csv' in file_ext:
+            # Sep=None lässt Python den Trenner (Komma, Semikolon, Tab) erraten
+            df_raw = pd.read_csv(uploaded_file, sep=None, engine='python', header=None)
+        else:
+            # Für Excel (.xlsx, .xls)
+            df_raw = pd.read_excel(uploaded_file, header=None)
+
+        # 2. Den Header suchen (Zeile, die 'time' und 'P' enthält)
+        header_row_idx = None
         
-        if not time_col:
-            time_col = df.columns[0]
-        if not power_col:
-            power_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+        # Wir scannen die ersten 20 Zeilen
+        for i, row in df_raw.head(20).iterrows():
+            # Zeile zu String konvertieren und klein machen für Suche
+            row_str = row.astype(str).str.lower().tolist()
+            
+            # Prüfen ob 'time' (oder 'date') UND 'p' in dieser Zeile vorkommen
+            has_time = any('time' in s or 'date' in s or 'zeit' in s for s in row_str)
+            has_power = any(s.strip() == 'p' for s in row_str) # Exakte Übereinstimmung für 'P' oft besser
+            
+            if has_time and has_power:
+                header_row_idx = i
+                break
         
-        # 3. German -> English number conversion
+        if header_row_idx is None:
+            st.error("Konnte keine Kopfzeile mit 'time' und 'P' finden. Ist es eine Original-PVGIS Datei?")
+            return None
+
+        # 3. Datei neu laden ab der gefundenen Kopfzeile
+        # Wir nehmen die gefundene Zeile als Columns
+        df_raw.columns = df_raw.iloc[header_row_idx]
+        # Daten sind alles danach
+        df = df_raw.iloc[header_row_idx + 1:].copy()
+        
+        # Index resetten, damit wir sauber arbeiten können
+        df.reset_index(drop=True, inplace=True)
+
+        # 4. Spalten reinigen (Leerzeichen entfernen)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Spaltennamen identifizieren (Groß-/Kleinschreibung ignorieren)
+        time_col = next((c for c in df.columns if 'time' in c.lower() or 'date' in c.lower() or 'zeit' in c.lower()), None)
+        power_col = next((c for c in df.columns if c == 'P'), None) # PVGIS nennt es meist exakt "P"
+
+        if not time_col or not power_col:
+            st.error(f"Konnte Spalten nicht eindeutig zuordnen. Gefunden: {df.columns.tolist()}")
+            return None
+
+        # 5. Datenbereinigung & Konvertierung
+        # Zahlenformat fixen (Deutsch 1.000,00 -> Englisch 1000.00)
         if df[power_col].dtype == object:
-            df[power_col] = (df[power_col].astype(str)
-                           .str.replace('.', '', regex=False)
-                           .str.replace(',', '.', regex=False))
+            df[power_col] = df[power_col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         
-        df[power_col] = pd.to_numeric(df[power_col], errors='coerce')
+        # Neue Spalten anlegen (sicherer als alte zu überschreiben -> löst "already exists" Fehler)
+        df['sim_power_mw'] = pd.to_numeric(df[power_col], errors='coerce') / 1_000_000.0 # Watt -> MW
+        df['sim_time'] = pd.to_datetime(df[time_col], errors='coerce')
+
+        # Leere Zeilen (z.B. Footer) entfernen
+        df = df.dropna(subset=['sim_time', 'sim_power_mw'])
+
+        # 6. P50 Berechnung (Durchschnittsjahr bilden)
+        # Wir nutzen 'sim_time' als Basis, setzen es aber noch nicht als Index, um Konflikte zu vermeiden
+        df['month'] = df['sim_time'].dt.month
+        df['day'] = df['sim_time'].dt.day
+        df['hour'] = df['sim_time'].dt.hour
         
-        # 4. Convert Watt to MW
-        max_val = df[power_col].max()
-        if max_val > 10000:  # Likely in Watts
-            df['mw_out'] = df[power_col] / 1_000_000.0
-        elif max_val > 100:  # Likely in kW
-            df['mw_out'] = df[power_col] / 1_000.0
-        else:
-            df['mw_out'] = df[power_col]
+        # Schaltjahre (29. Feb) rauswerfen für sauberes 8760h Jahr
+        df = df[~((df['month'] == 2) & (df['day'] == 29))]
         
-        # 5. Parse timestamp
-        df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-        df = df.dropna(subset=[time_col, 'mw_out'])
-        df.set_index(time_col, inplace=True)
+        # Gruppieren nach (Monat, Tag, Stunde) -> Mittelwert über alle Jahre (2005-2023)
+        df_p50 = df.groupby(['month', 'day', 'hour'])['sim_power_mw'].mean().reset_index()
         
-        # 6. Create P50 representative year
-        st.info(f"Analyzing historical dataset from {df.index.year.min()} to {df.index.year.max()}...")
-        
-        # Group by (month, day, hour) and take mean
-        df_p50 = df.groupby([df.index.month, df.index.day, df.index.hour])['mw_out'].mean().reset_index()
-        df_p50.columns = ['month', 'day', 'hour', 'mw']
-        
-        # Remove Feb 29 for non-leap year
-        df_p50 = df_p50[~((df_p50['month'] == 2) & (df_p50['day'] == 29))]
-        
-        # Create datetime index for target year
+        # 7. Finales Zeitprofil erstellen (z.B. für 2025)
+        # Wir bauen einen neuen Index
         try:
-            p50_series = pd.Series(df_p50['mw'].values, index=pd.to_datetime(
-                dict(year=2025, month=df_p50['month'], day=df_p50['day'], hour=df_p50['hour'])
-            ))
+            # Versuche ein Standardjahr zu bauen
+            df_p50['temp_year'] = 2025 
+            df_p50['datetime'] = pd.to_datetime(df_p50[['temp_year', 'month', 'day', 'hour']])
+            df_p50 = df_p50.sort_values('datetime').set_index('datetime')
+            
+            # Sicherstellen dass wir 8760 Werte haben
             full_idx = pd.date_range('2025-01-01', '2025-12-31 23:00', freq='h')
-            p50_series = p50_series.reindex(full_idx).interpolate().fillna(0)
-            final_mw = p50_series.values
-        except:
-            # Fallback: just use the values directly
-            final_mw = df_p50['mw'].values[:8760]
-            if len(final_mw) < 8760:
-                final_mw = np.pad(final_mw, (0, 8760 - len(final_mw)), mode='constant')
-        
-        # 7. Normalize to peak
-        peak_p50 = np.max(final_mw)
-        if peak_p50 > 0:
-            normalized_profile = final_mw / peak_p50
+            df_final = df_p50.reindex(full_idx).fillna(0) # Fehlende Stunden mit 0 füllen
+            
+            final_mw_profile = df_final['sim_power_mw'].values
+            
+        except Exception as e:
+            st.warning(f"Fehler beim Erstellen des Zeitindexes: {e}. Nutze Rohdaten.")
+            # Fallback: Einfach die Werte nehmen, falls Datetime fehlschlägt
+            final_mw_profile = df_p50['sim_power_mw'].values
+            if len(final_mw_profile) != 8760:
+                # Resize brute force (nicht schön, aber verhindert Crash)
+                final_mw_profile = np.resize(final_mw_profile, 8760)
+
+        # 8. Normierung (0 bis 1)
+        peak_val = final_mw_profile.max()
+        if peak_val > 0:
+            norm_profile = final_mw_profile / peak_val
         else:
-            normalized_profile = final_mw
-        
-        return normalized_profile
-    
+            norm_profile = final_mw_profile
+
+        return norm_profile
+
     except Exception as e:
-        st.error(f"Error parsing PVGIS file: {str(e)}")
+        st.error(f"Kritischer Fehler beim Parsen: {e}")
         return None
 
 
@@ -908,3 +937,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
